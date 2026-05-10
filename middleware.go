@@ -110,7 +110,7 @@ func extractBearer(r *http.Request) string {
 func writeUnauthorized(w http.ResponseWriter, reason, description string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("WWW-Authenticate",
-		`Bearer error="invalid_token", error_description="`+description+`"`)
+		`Bearer error="invalid_token", error_description="`+sanitiseHeaderValue(description)+`"`)
 	w.WriteHeader(http.StatusUnauthorized)
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"error":             "invalid_token",
@@ -122,13 +122,34 @@ func writeUnauthorized(w http.ResponseWriter, reason, description string) {
 func writeForbidden(w http.ResponseWriter, requiredScope string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("WWW-Authenticate",
-		`Bearer error="insufficient_scope", scope="`+requiredScope+`"`)
+		`Bearer error="insufficient_scope", scope="`+sanitiseHeaderValue(requiredScope)+`"`)
 	w.WriteHeader(http.StatusForbidden)
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"error":             "insufficient_scope",
 		"error_description": "Required scope `" + requiredScope + "` is not present in the token.",
 		"required_scope":    requiredScope,
 	})
+}
+
+// sanitiseHeaderValue strips bytes that would let a crafted error
+// description break out of the WWW-Authenticate quoted-string and
+// inject CRLF / extra headers. Replaces forbidden bytes with a
+// single space so the message stays readable. Mirrors the PHP
+// package's RequireOauthJwksValidation::sanitiseHeaderValue.
+func sanitiseHeaderValue(value string) string {
+	out := make([]byte, 0, len(value))
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		switch {
+		case b < 0x20, b == 0x7F: // control chars including CR/LF
+			out = append(out, ' ')
+		case b == '"', b == '\\':
+			out = append(out, ' ')
+		default:
+			out = append(out, b)
+		}
+	}
+	return string(out)
 }
 
 // errAs is a thin wrapper around errors.As that keeps the package
