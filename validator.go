@@ -124,6 +124,19 @@ func (v *Validator) Validate(ctx context.Context, tokenString string) (*Claims, 
 		return nil, classifyParseError(err)
 	}
 
+	// SECURITY: lestrrat's jwt.Parse silently accepts a token
+	// that omits `exp` — the validator runs only when the claim
+	// is present. We REQUIRE `exp` so a forged token without an
+	// expiry can't be accepted as never-expiring. PHP's pendant
+	// (`cbox-id-jwks-auth/src/JwksValidator.php::checkExpiry`)
+	// does the same; this keeps the two languages symmetrical.
+	if parsed.Expiration().IsZero() {
+		return nil, &InvalidTokenError{
+			Reason:  "missing_exp",
+			Message: "token is missing the exp claim",
+		}
+	}
+
 	return claimsFromJWT(parsed), nil
 }
 

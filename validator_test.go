@@ -231,6 +231,42 @@ func TestAcceptsArrayAudienceContainingValue(t *testing.T) {
 	}
 }
 
+func TestRejectsTokenWithoutExpClaim(t *testing.T) {
+	// SECURITY: lestrrat's jwt.Parse skips exp validation when
+	// the claim is absent. We require exp so an attacker can't
+	// forge a never-expiring token by omitting the claim.
+	s := newSigner(t, "kid-1")
+	srv := jwksServer(t, s)
+	v := newValidator(t, srv.URL+"/.well-known/jwks.json")
+
+	// Mint a token with NO exp claim by using jws.Sign directly
+	// to avoid jwt.Sign's auto-default behaviours, then assert
+	// validation rejects it.
+	tok := jwt.New()
+	_ = tok.Set(jwt.IssuerKey, testIssuer)
+	_ = tok.Set(jwt.AudienceKey, []string{testAudience})
+	_ = tok.Set(jwt.SubjectKey, "no-exp-attacker")
+	_ = tok.Set(jwt.IssuedAtKey, time.Now())
+	_ = tok.Set(jwt.NotBeforeKey, time.Now())
+	// no exp set
+
+	signed, err := jwt.Sign(tok,
+		jwt.WithKey(jwa.RS256, s.private, jws.WithProtectedHeaders(headerWithKid(s.kid))),
+	)
+	if err != nil {
+		t.Fatalf("jwt.Sign: %v", err)
+	}
+
+	_, err = v.Validate(t.Context(), string(signed))
+	var ite *cboxidjwksauth.InvalidTokenError
+	if !errors.As(err, &ite) {
+		t.Fatalf("expected *InvalidTokenError, got %T (%v)", err, err)
+	}
+	if ite.Reason != "missing_exp" {
+		t.Errorf("Reason = %q, want missing_exp", ite.Reason)
+	}
+}
+
 func TestRejectsExpiredToken(t *testing.T) {
 	s := newSigner(t, "kid-1")
 	srv := jwksServer(t, s)
