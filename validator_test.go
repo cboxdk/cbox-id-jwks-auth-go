@@ -483,6 +483,184 @@ func slicesContains(haystack []string, needle string) bool {
 	return false
 }
 
+// rotatingJwksServer serves a JWKS that the test can swap at
+// runtime. Used to exercise the kid-miss force-refresh path.
+type rotatingJwksServer struct {
+	*httptest.Server
+	mu  func(set jwk.Set) // setter (closes over a pointer)
+	hit *int32
+}
+
+func newRotatingJwksServer(t *testing.T, initial ...*signer) (*httptest.Server, func(...*signer)) {
+	t.Helper()
+	current := jwk.NewSet()
+	for _, s := range initial {
+		_ = current.AddKey(s.public)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/.well-known/jwks.json") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(current)
+	}))
+	t.Cleanup(srv.Close)
+	swap := func(signers ...*signer) {
+		ns := jwk.NewSet()
+		for _, s := range signers {
+			_ = ns.AddKey(s.public)
+		}
+		current = ns
+	}
+	return srv, swap
+}
+
+func TestKidMissRefreshPicksUpRotatedKey(t *testing.T) {
+	old := newSigner(t, "old-kid")
+	srv, swap := newRotatingJwksServer(t, old)
+
+	v := newValidator(t, srv.URL+"/.well-known/jwks.json")
+
+	// Warm cache with the original keyset.
+	if _, err := v.Validate(t.Context(), old.mintToken(t)); err != nil {
+		t.Fatalf("warm validate: %v", err)
+	}
+
+	// id rotates: old key out, new key in. The cache hasn't refreshed
+	// (its interval is hours), but the validator's kid-miss path
+	// should force a refresh and re-validate the freshly-issued
+	// token transparently.
+	rotated := newSigner(t, "rotated-kid")
+	swap(rotated)
+
+	token := rotated.mintToken(t)
+	claims, err := v.Validate(t.Context(), token)
+	if err != nil {
+		t.Fatalf("post-rotation Validate: %v", err)
+	}
+	if claims.Subject != "vault-prod" {
+		t.Errorf("Subject = %q", claims.Subject)
+	}
+}
+
+func TestKidMissRefreshDoesNotLoopOnGenuineUnknownKid(t *testing.T) {
+	publishedSigner := newSigner(t, "published-kid")
+	srv, _ := newRotatingJwksServer(t, publishedSigner)
+	v := newValidator(t, srv.URL+"/.well-known/jwks.json")
+
+	// Mint a token with a kid that's NEVER in the JWKS. The retry
+	// path will refresh once, see the same keyset, and surface
+	// reason=unknown_kid (or bad_signature/malformed) — never
+	// retries indefinitely. We assert the call returns within a
+	// short timeout, not that it spins.
+	otherSigner := newSigner(t, "drift-kid")
+	token := otherSigner.mintToken(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	_, err := v.Validate(ctx, token)
+	var ite *cboxidjwksauth.InvalidTokenError
+	if !errors.As(err, &ite) {
+		t.Fatalf("expected *InvalidTokenError, got %T (%v)", err, err)
+	}
+}
+
+func TestStaleFallbackPathBootsValidatorWhenIDIsDownAtStartup(t *testing.T) {
+	s := newSigner(t, "kid-1")
+
+	// Phase 1: id is up. A first validator persists the JWKS to disk.
+	upSrv, _ := newRotatingJwksServer(t, s)
+	jwksURI := upSrv.URL + "/.well-known/jwks.json"
+
+	staleFile := t.TempDir() + "/jwks.json"
+
+	v1 := newValidator(t, jwksURI, cboxidjwksauth.WithStaleFallbackPath(staleFile))
+	if _, err := v1.Validate(t.Context(), s.mintToken(t)); err != nil {
+		t.Fatalf("phase 1 Validate: %v", err)
+	}
+	v1.Close()
+	upSrv.Close()
+
+	// Phase 2: id is down. A fresh validator pointing at a dead URL
+	// + the same fallback path bootstraps from the stale file and
+	// validates a freshly-minted token signed with the original key.
+	deadURL := "http://127.0.0.1:1/.well-known/jwks.json"
+
+	v2, err := cboxidjwksauth.New(t.Context(),
+		cboxidjwksauth.WithIssuer(testIssuer),
+		cboxidjwksauth.WithAudience(testAudience),
+		cboxidjwksauth.WithJWKSURI(deadURL),
+		cboxidjwksauth.WithStaleFallbackPath(staleFile),
+	)
+	if err != nil {
+		t.Fatalf("phase 2 New: %v", err)
+	}
+	defer v2.Close()
+
+	if _, err := v2.Validate(t.Context(), s.mintToken(t)); err != nil {
+		t.Fatalf("phase 2 Validate (stale fallback): %v", err)
+	}
+}
+
+func TestValidatorCloseIsIdempotent(t *testing.T) {
+	s := newSigner(t, "kid-1")
+	srv := jwksServer(t, s)
+	v := newValidator(t, srv.URL+"/.well-known/jwks.json")
+
+	v.Close()
+	v.Close() // must not panic / double-cancel
+}
+
+func TestValidatorRejectsWeakRSAKeysInJWKS(t *testing.T) {
+	// Generate a 1024-bit key, hand-publish via JWKS doc.
+	priv, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	pub, err := jwk.FromRaw(priv.Public())
+	if err != nil {
+		t.Fatalf("jwk.FromRaw: %v", err)
+	}
+	_ = pub.Set(jwk.KeyIDKey, "weak-kid")
+	_ = pub.Set(jwk.AlgorithmKey, jwa.RS256)
+
+	set := jwk.NewSet()
+	_ = set.AddKey(pub)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(set)
+	}))
+	t.Cleanup(srv.Close)
+
+	v := newValidator(t, srv.URL+"/.well-known/jwks.json")
+
+	// Mint a token signed with the weak key. The validator should
+	// reject because the JWKS doc contained no acceptable keys.
+	tok := jwt.New()
+	_ = tok.Set(jwt.IssuerKey, testIssuer)
+	_ = tok.Set(jwt.AudienceKey, []string{testAudience})
+	_ = tok.Set(jwt.SubjectKey, "attacker")
+	_ = tok.Set(jwt.IssuedAtKey, time.Now())
+	_ = tok.Set(jwt.NotBeforeKey, time.Now())
+	_ = tok.Set(jwt.ExpirationKey, time.Now().Add(10*time.Minute))
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.RS256, priv, jws.WithProtectedHeaders(headerWithKid("weak-kid"))))
+	if err != nil {
+		t.Fatalf("jwt.Sign: %v", err)
+	}
+
+	_, err = v.Validate(t.Context(), string(signed))
+	var ite *cboxidjwksauth.InvalidTokenError
+	if !errors.As(err, &ite) {
+		t.Fatalf("expected *InvalidTokenError, got %T (%v)", err, err)
+	}
+	if ite.Reason != "jwks_unavailable" {
+		t.Errorf("Reason = %q, want jwks_unavailable (weak-only JWKS should fail loud)", ite.Reason)
+	}
+}
+
 // silence unused-import warning if we ever drop the helper.
 var _ = context.Background
 var _ = fmt.Sprintf
